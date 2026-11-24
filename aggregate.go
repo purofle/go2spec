@@ -138,6 +138,16 @@ func validLicenseExpression(text string) bool {
 	return depth == 0 && !operand && !strings.ContainsAny(text, "\r\n\x00")
 }
 
+func isLicenseFilename(name string) bool {
+	name = strings.ToUpper(name)
+	for _, base := range []string{"LICENSE", "LICENCE", "COPYING", "NOTICE"} {
+		if name == base || strings.HasPrefix(name, base+".") || strings.HasPrefix(name, base+"-") || strings.HasPrefix(name, base+"_") {
+			return true
+		}
+	}
+	return false
+}
+
 func sourceLicenseFiles(dir string) ([]string, error) {
 	var files []string
 	err := filepath.WalkDir(dir, func(p string, entry fs.DirEntry, err error) error {
@@ -147,15 +157,7 @@ func sourceLicenseFiles(dir string) ([]string, error) {
 		if entry.IsDir() {
 			return nil
 		}
-		name := strings.ToUpper(entry.Name())
-		recognized := false
-		for _, base := range []string{"LICENSE", "LICENCE", "COPYING", "NOTICE"} {
-			if name == base || strings.HasPrefix(name, base+".") || strings.HasPrefix(name, base+"-") || strings.HasPrefix(name, base+"_") {
-				recognized = true
-				break
-			}
-		}
-		if !recognized {
+		if !isLicenseFilename(entry.Name()) {
 			return nil
 		}
 		rel, err := filepath.Rel(dir, p)
