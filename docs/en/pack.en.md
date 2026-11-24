@@ -37,6 +37,9 @@ go2spec pack golang.org/x/net
 -provides <import-path>
     Override the library RPM go(import/path) Provides
 
+-repo_url <url>
+    Override the upstream Git repository URL for one package
+
 -allow_unknown_hoster
     Allow package-name generation for unknown hosters, Review the generated name manually
 ```
@@ -81,6 +84,17 @@ Provides:       go(example.org/rpm/discordgo) = %{version}
 ```
 
 Sources are still installed under `%{go_sys_gopath}/github.com/bwmarrin/discordgo`.
+
+For a fork not listed on pkg.go.dev, pass its repository root path directly (or
+specify `-repo_url <https://...>`):
+
+```bash
+go2spec pack -type library -provides github.com/yeongaori/discordgo-fork github.com/yeongaori/discordgo-fork@v0.0.0-20260319072544-e8e546f5d532
+```
+
+`go_import_path` and the installation path still follow the fork's `go.mod`,
+while `-provides` sets a separate RPM capability. `License:` is left as `TODO`
+for manual review.
 
 ## Combine Independent Module Releases into One RPM
 

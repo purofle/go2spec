@@ -9,18 +9,6 @@ import (
 	"strings"
 )
 
-func getRepoURLForGopkg(gopkg string) (string, error) {
-	info, err := getPkgsiteInfo(context.TODO(), gopkg)
-	if err != nil {
-		return "", err
-	}
-	repoURL := strings.TrimSpace(info.Module.RepoURL)
-	if repoURL == "" {
-		return "", fmt.Errorf("pkgsite module %q has no repository URL", info.Module.Path)
-	}
-	return gitCloneURLFromRepoURL(repoURL), nil
-}
-
 var (
 	htmlTagRegexp      = regexp.MustCompile(`<[^>]*>`)
 	markdownImageRegex = regexp.MustCompile(`!\[[^\]]*\]\([^)]+\)`)

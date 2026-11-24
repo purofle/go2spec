@@ -37,6 +37,9 @@ go2spec pack golang.org/x/net
 -provides <import-path>
     覆盖库包的 RPM go(import/path) Provides
 
+-repo_url <url>
+    覆盖单个包的 Git 源码仓库地址
+
 -allow_unknown_hoster
     允许未知 hoster 参与包名生成，生成结果必须人工检查
 ```
@@ -80,6 +83,14 @@ Provides:       go(example.org/rpm/discordgo) = %{version}
 ```
 
 源码仍安装到 `%{go_sys_gopath}/github.com/bwmarrin/discordgo`。
+
+对于未被 pkg.go.dev 收录的 Fork，可直接传入仓库根路径（或用 `-repo_url <https://...>` 指定仓库地址）：
+
+```bash
+go2spec pack -type library -provides github.com/yeongaori/discordgo-fork github.com/yeongaori/discordgo-fork@v0.0.0-20260319072544-e8e546f5d532
+```
+
+`go_import_path` 与安装路径仍按 Fork 的 `go.mod` 生成，`-provides` 用于声明独立的 RPM capability，`License:` 保留为 `TODO` 由维护者补充。
 
 ## 多个 module 分别选版本，合成一个 RPM
 

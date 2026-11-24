@@ -39,23 +39,25 @@ const (
 type upstream struct {
 	repoURL      string
 	modulePath   string
-	tarPath      string   // path to the downloaded or generated orig tarball tempfile
-	compression  string   // compression method, either "gz" or "xz"
-	version      string   // upstream version number, e.g. 0.0~git20180204.1d24609
-	commitID     string   // full commit hash for commit-pinned snapshot builds
-	tag          string   // Latest upstream tag, if any
-	commitIsh    string   // commit-ish corresponding to upstream version to be packaged
-	remote       string   // git remote, set to short hostname if upstream git history is included
-	firstMain    string   // import path of the first main package within repo, if any
-	packageName  string   // package name of the requested package from pkg.go.dev
-	vendorDirs   []string // all vendor sub directories, relative to the repo directory
-	repoDeps     []string // all non-stdlib imports needed for build or tests
-	repoRunDeps  []string // non-stdlib imports needed by normal builds, excluding test-only imports
-	repoTestDeps []string // non-stdlib imports needed only by tests
-	hasGodeps    bool     // whether the Godeps/_workspace directory exists
-	hasRelease   bool     // whether any release tags exist, for debian/watch
-	isRelease    bool     // whether what we end up packaging is a tagged release
-	sha256       string   // SHA256 checksum of the source tarball
+	importPath   string        // module directive from source when it differs or pkgsite cannot locate it
+	metadata     *specMetadata // metadata read from local source checkout when pkgsite is not used
+	tarPath      string        // path to the downloaded or generated orig tarball tempfile
+	compression  string        // compression method, either "gz" or "xz"
+	version      string        // upstream version number, e.g. 0.0~git20180204.1d24609
+	commitID     string        // full commit hash for commit-pinned snapshot builds
+	tag          string        // Latest upstream tag, if any
+	commitIsh    string        // commit-ish corresponding to upstream version to be packaged
+	remote       string        // git remote, set to short hostname if upstream git history is included
+	firstMain    string        // import path of the first main package within repo, if any
+	packageName  string        // package name from pkgsite or the downloaded source
+	vendorDirs   []string      // all vendor sub directories, relative to the repo directory
+	repoDeps     []string      // all non-stdlib imports needed for build or tests
+	repoRunDeps  []string      // non-stdlib imports needed by normal builds, excluding test-only imports
+	repoTestDeps []string      // non-stdlib imports needed only by tests
+	hasGodeps    bool          // whether the Godeps/_workspace directory exists
+	hasRelease   bool          // whether any release tags exist, for debian/watch
+	isRelease    bool          // whether what we end up packaging is a tagged release
+	sha256       string        // SHA256 checksum of the source tarball
 }
 
 var errUnsupportedHoster = errors.New("unsupported hoster")
@@ -64,6 +66,16 @@ type packRequest struct {
 	arg      string
 	gopkg    string
 	revision string
+	prepared *upstream
+}
+
+type packOptions struct {
+	forcePrerelease    bool
+	pkgType            packageType
+	customProgPkgName  string
+	allowUnknownHoster bool
+	providesPath       string
+	repoURL            string
 }
 
 func passthroughEnv() []string {
@@ -158,21 +170,10 @@ func fetchText(url string) (string, error) {
 
 // get downloads the source module into the provided GOPATH,
 // checking out the specified revision if non-empty.
-func (u *upstream) get(gopath, sourceRepo, requestedPath, rev string) error {
+func (u *upstream) get(gopath, sourceRepo, rev string) error {
 	done := make(chan struct{})
 	defer close(done)
 	go progressSize("git clone", filepath.Join(gopath, "src"), done)
-
-	info, err := getPkgsiteInfo(context.TODO(), requestedPath)
-	if err != nil {
-		return fmt.Errorf("get pkgsite metadata: %w", err)
-	}
-	u.packageName = info.Package.Name
-	u.modulePath = info.Module.Path
-	u.repoURL = gitCloneURLFromRepoURL(info.Module.RepoURL)
-	if u.repoURL == "" {
-		return fmt.Errorf("pkgsite module %q has no repository URL", info.Module.Path)
-	}
 
 	dir := filepath.Join(gopath, "src", sourceRepo)
 	if err := os.MkdirAll(filepath.Dir(dir), 0755); err != nil {
@@ -190,6 +191,7 @@ func (u *upstream) get(gopath, sourceRepo, requestedPath, rev string) error {
 	if rev != "" {
 		checkoutRev := rev
 		if module.IsPseudoVersion(rev) {
+			var err error
 			checkoutRev, err = module.PseudoVersionRev(rev)
 			if err != nil {
 				return fmt.Errorf("parse pseudo-version %q: %w", rev, err)
@@ -381,10 +383,9 @@ func (u *upstream) sourceURLForSpec(modulePath string) (string, error) {
 	if err == nil {
 		return fmt.Sprintf("%s#/%%{_name}-%%{version}.tar.gz", tarURL), nil
 	}
-	if err != errUnsupportedHoster || modulePath == "" || strings.Contains(ref, "commit_id") {
+	if !errors.Is(err, errUnsupportedHoster) || modulePath == "" || strings.Contains(ref, "commit_id") {
 		return "", err
 	}
-
 	return fmt.Sprintf("https://proxy.golang.org/%s/@v/%s.zip#/%%{_name}-%%{version}.zip",
 		moduleProxyEscapedPath(modulePath), moduleProxyVersionForSpec(ref)), nil
 }
@@ -572,7 +573,11 @@ func (u *upstream) tar(gopath, repo string) error {
 // findMains finds main packages within the repo (useful to auto-detect the
 // package type).
 func (u *upstream) findMains(gopath, repo string) error {
-	cmd := exec.Command("go", "list", "-e", "-f", "{{.ImportPath}} {{.Name}}", repo+"/...")
+	pattern := repo
+	if u.importPath != "" {
+		pattern = "."
+	}
+	cmd := exec.Command("go", "list", "-e", "-f", "{{.ImportPath}} {{.Name}}", pattern+"/...")
 	cmd.Dir = filepath.Join(gopath, "src", repo)
 	cmd.Env = passthroughEnv()
 	cmd.Stderr = os.Stderr
@@ -581,7 +586,7 @@ func (u *upstream) findMains(gopath, repo string) error {
 	if err != nil {
 		log.Println("WARNING: In findMains:", fmt.Errorf("%q: %w", cmd.Args, err))
 		log.Printf("Retrying without appending \"/...\" to repo")
-		cmd = exec.Command("go", "list", "-e", "-f", "{{.ImportPath}} {{.Name}}", repo)
+		cmd = exec.Command("go", "list", "-e", "-f", "{{.ImportPath}} {{.Name}}", pattern)
 		cmd.Dir = filepath.Join(gopath, "src", repo)
 		cmd.Env = passthroughEnv()
 		cmd.Stderr = os.Stderr
@@ -609,6 +614,7 @@ func (u *upstream) findMains(gopath, repo string) error {
 
 type goListPackage struct {
 	ImportPath   string
+	Name         string
 	Imports      []string
 	TestImports  []string
 	XTestImports []string
@@ -674,7 +680,11 @@ func (u *upstream) setRepoDependencies(runtimeDeps, testDeps map[string]bool) {
 func (u *upstream) findDependencies(gopath, repo string) error {
 	log.Printf("Determining dependencies\n")
 
-	cmd := exec.Command("go", "list", "-e", "-json", repo+"/...")
+	pattern, importPath := repo, repo
+	if u.importPath != "" {
+		pattern, importPath = ".", u.importPath
+	}
+	cmd := exec.Command("go", "list", "-e", "-json", pattern+"/...")
 	cmd.Dir = filepath.Join(gopath, "src", repo)
 	cmd.Env = passthroughEnv()
 	cmd.Stderr = os.Stderr
@@ -684,7 +694,7 @@ func (u *upstream) findDependencies(gopath, repo string) error {
 		log.Println("WARNING: In findDependencies:", fmt.Errorf("%q: %w", cmd.Args, err))
 		// See https://bugs.debian.org/992610
 		log.Printf("Retrying without appending \"/...\" to repo")
-		cmd = exec.Command("go", "list", "-e", "-json", repo)
+		cmd = exec.Command("go", "list", "-e", "-json", pattern)
 		cmd.Dir = filepath.Join(gopath, "src", repo)
 		cmd.Env = passthroughEnv()
 		cmd.Stderr = os.Stderr
@@ -709,9 +719,12 @@ func (u *upstream) findDependencies(gopath, repo string) error {
 		if pkg.Error != nil && pkg.Error.Err != "" {
 			log.Printf("WARNING: go list reported package load error for %q: %s\n", pkg.ImportPath, pkg.Error.Err)
 		}
-		addGoDependencies(runtimeDeps, repo, pkg.Imports)
-		addGoDependencies(testDeps, repo, pkg.TestImports)
-		addGoDependencies(testDeps, repo, pkg.XTestImports)
+		if u.importPath != "" && pkg.ImportPath == u.importPath {
+			u.packageName = pkg.Name
+		}
+		addGoDependencies(runtimeDeps, importPath, pkg.Imports)
+		addGoDependencies(testDeps, importPath, pkg.TestImports)
+		addGoDependencies(testDeps, importPath, pkg.XTestImports)
 	}
 
 	if len(runtimeDeps) == 0 && len(testDeps) == 0 {
@@ -743,8 +756,25 @@ func (u *upstream) findDependencies(gopath, repo string) error {
 // vendored dependencies, and creates a tarball of the upstream source code.
 // It also discovers main packages and dependencies, and may check out a release
 // tag different from the requested revision when pkgVersionFromGit selects one.
-// It returns an upstream struct describing the downloaded package.
-func makeUpstreamSourceTarball(requestedPath, sourceRepo, revision string, forcePrerelease bool) (*upstream, error) {
+// The caller must remove the returned tarPath after copying it.
+func makeUpstreamSourceTarball(requestedPath, revision string, forcePrerelease bool, info *pkgsiteInfo, explicitRepoURL string) (*upstream, error) {
+	sourceRepo := sourceImportPathForPackage(requestedPath, info)
+	u := &upstream{modulePath: sourceRepo}
+	if info == nil {
+		if err := module.CheckPath(requestedPath); err != nil {
+			return nil, err
+		}
+		if explicitRepoURL != "" {
+			u.repoURL = gitCloneURLFromRepoURL(explicitRepoURL)
+		} else {
+			repoPath, _, _ := module.SplitPathVersion(requestedPath)
+			u.repoURL = gitCloneURLFromRepoURL("https://" + repoPath)
+		}
+	} else {
+		u.repoURL = gitCloneURLFromRepoURL(info.Module.RepoURL)
+		u.packageName = info.Package.Name
+	}
+
 	gopath, err := os.MkdirTemp("", "pack-tmp")
 	if err != nil {
 		return nil, fmt.Errorf("create tmp dir: %w", err)
@@ -752,10 +782,8 @@ func makeUpstreamSourceTarball(requestedPath, sourceRepo, revision string, force
 	defer os.RemoveAll(gopath)
 	repoDir := filepath.Join(gopath, "src", sourceRepo)
 
-	var u upstream
-
 	log.Printf("Downloading %q\n", sourceRepo+"/...")
-	if err := u.get(gopath, sourceRepo, requestedPath, revision); err != nil {
+	if err := u.get(gopath, sourceRepo, revision); err != nil {
 		return nil, fmt.Errorf("get source: %w", err)
 	}
 
@@ -785,14 +813,11 @@ func makeUpstreamSourceTarball(requestedPath, sourceRepo, revision string, force
 	log.Printf("Determining upstream version number\n")
 
 	preferredRevision := revision
-	if preferredRevision == "" {
-		// Reuses the cache populated by u.get above when available.
-		if info, err := getPkgsiteInfo(context.TODO(), requestedPath); err == nil {
-			preferredRevision = info.Package.Version
-			log.Printf("Using pkg.go.dev latest version %q as the preferred release", preferredRevision)
-		}
+	if preferredRevision == "" && info != nil {
+		preferredRevision = info.Package.Version
+		log.Printf("Using pkg.go.dev latest version %q as the preferred release", preferredRevision)
 	}
-	u.version, err = pkgVersionFromGit(repoDir, &u, preferredRevision, forcePrerelease)
+	u.version, err = pkgVersionFromGit(repoDir, u, preferredRevision, forcePrerelease)
 	if err != nil {
 		return nil, fmt.Errorf("get package version from Git: %w", err)
 	}
@@ -812,6 +837,17 @@ func makeUpstreamSourceTarball(requestedPath, sourceRepo, revision string, force
 		}
 	}
 
+	if info == nil {
+		data, err := os.ReadFile(filepath.Join(repoDir, "go.mod"))
+		if err != nil {
+			return nil, fmt.Errorf("read source go.mod: %w", err)
+		}
+		u.importPath = modfile.ModulePath(data)
+		if err := module.CheckPath(u.importPath); err != nil {
+			return nil, fmt.Errorf("source module path: %w", err)
+		}
+	}
+
 	if err := u.findMains(gopath, sourceRepo); err != nil {
 		return nil, fmt.Errorf("find mains: %w", err)
 	}
@@ -820,11 +856,16 @@ func makeUpstreamSourceTarball(requestedPath, sourceRepo, revision string, force
 		return nil, fmt.Errorf("find dependencies: %w", err)
 	}
 
+	if info == nil {
+		m := readSpecMetadata(requestedPath, repoDir)
+		u.metadata = &m
+	}
+
 	if err := u.tar(gopath, sourceRepo); err != nil {
 		return nil, fmt.Errorf("tar: %w", err)
 	}
 
-	return &u, nil
+	return u, nil
 }
 
 func createDirectory(openRuyiSrc string) (string, error) {
@@ -953,6 +994,21 @@ func nameFromGopkg(gopkg string, t packageType, customProgPkgName string, allowU
 	return normalizePackageName("go-" + strings.Join(parts, "-"))
 }
 
+func validateRepoURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil ||
+		(u.Scheme != "https" && u.Scheme != "http") ||
+		u.Host == "" ||
+		u.User != nil ||
+		u.RawQuery != "" ||
+		u.Fragment != "" ||
+		strings.ContainsAny(raw, " \t") {
+		return "", fmt.Errorf("-repo_url requires an HTTP(S) Git repository URL without credentials, query, fragment or spaces")
+	}
+	return raw, nil
+}
+
 func copyFile(src, dest string) error {
 	input, err := os.Open(src)
 	if err != nil {
@@ -1032,6 +1088,12 @@ func mainPack(args []string, usage func()) int {
 		"",
 		"Override the RPM go(import/path) capability for one library package")
 
+	var repoURL string
+	flagSet.StringVar(&repoURL,
+		"repo_url",
+		"",
+		"Override the upstream Git repository URL for one package")
+
 	var allowUnknownHoster bool
 	flagSet.BoolVar(&allowUnknownHoster,
 		"allow_unknown_hoster",
@@ -1061,7 +1123,7 @@ func mainPack(args []string, usage func()) int {
 	visited := make(map[string]bool)
 	flagSet.Visit(func(f *flag.Flag) { visited[f.Name] = true })
 	if visited["combine"] {
-		for _, name := range []string{"git_revision", "force_prerelease", "list", "program_package_name", "allow_unknown_hoster", "provides"} {
+		for _, name := range []string{"git_revision", "force_prerelease", "list", "program_package_name", "allow_unknown_hoster", "provides", "repo_url"} {
 			if visited[name] {
 				log.Printf("-%s cannot be combined with -combine", name)
 				return 1
@@ -1111,6 +1173,18 @@ func mainPack(args []string, usage func()) int {
 			log.Fatal("-provides requires exactly one package argument and cannot be combined with -list")
 		}
 	}
+	if visited["repo_url"] {
+		var err error
+		repoURL, err = validateRepoURL(repoURL)
+		if err != nil {
+			log.Print(err)
+			return 1
+		}
+		if listFile != "" || flagSet.NArg() != 1 {
+			log.Print("-repo_url requires exactly one package argument and cannot be combined with -list")
+			return 1
+		}
+	}
 
 	// A package argument or a package-list file is required.
 	if flagSet.NArg() < 1 && listFile == "" {
@@ -1148,13 +1222,25 @@ func mainPack(args []string, usage func()) int {
 		log.Fatalf("parse package list: %v", err)
 	}
 
+	opts := packOptions{
+		forcePrerelease:    forcePrerelease,
+		pkgType:            pkgType,
+		customProgPkgName:  customProgPkgName,
+		allowUnknownHoster: allowUnknownHoster,
+		providesPath:       providesPath,
+		repoURL:            repoURL,
+	}
+
 	// Now we verify that all packages are valid
-	if err := preflightPackRequests(context.TODO(), requests, pkgType, customProgPkgName, allowUnknownHoster, providesPath); err != nil {
+	if err := preflightPackRequests(context.TODO(), requests, opts); err != nil {
 		log.Fatalf("preflight package list: %v", err)
 	}
 
 	for _, req := range requests {
-		packPackage(req.gopkg, req.revision, forcePrerelease, pkgType, customProgPkgName, allowUnknownHoster, providesPath)
+		if err := packPackage(req.gopkg, req.revision, opts, req.prepared); err != nil {
+			cleanupPreparedRequests(requests)
+			log.Fatalf("pack %q: %v", req.arg, err)
+		}
 	}
 	return 0
 }
@@ -1217,52 +1303,151 @@ func parsePackListFile(filename string) ([]packRequest, error) {
 	return requests, nil
 }
 
-func preflightPackRequests(ctx context.Context, requests []packRequest, pkgType packageType, customProgPkgName string, allowUnknownHoster bool, providesPath string) error {
-	seenOutputDirs := make(map[string]string)
+func trimRepoScheme(gopkg string) string {
+	for _, prefix := range []string{"https://", "http://", "git://"} {
+		gopkg = strings.TrimPrefix(gopkg, prefix)
+	}
+	return gopkg
+}
+
+func checkEmptyOutputDir(dir string) error {
+	dirInfo, err := os.Stat(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat %q: %w", dir, err)
+	}
+	if !dirInfo.IsDir() {
+		return fmt.Errorf("%q is not a directory", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", dir, err)
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("%q is non-empty", dir)
+	}
+	return nil
+}
+
+func cleanupPreparedRequests(requests []packRequest) {
 	for _, req := range requests {
-		gopkg := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(req.gopkg, "https://"), "http://"), "git://")
-		info, err := getPkgsiteInfo(ctx, gopkg)
+		if req.prepared != nil && req.prepared.tarPath != "" {
+			_ = os.Remove(req.prepared.tarPath)
+		}
+	}
+}
+
+// needsGitSourceFallback reports whether a pkgsite lookup result means that
+// gopkg is not on pkg.go.dev, so its Git repository must be used directly.
+// Any other lookup error is returned as is.
+func needsGitSourceFallback(gopkg string, info *pkgsiteInfo, err error) (string, error) {
+	var apiErr *pkgsiteAPIError
+	switch {
+	case err != nil && errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound:
+		return fmt.Sprintf("pkgsite does not know %q", gopkg), nil
+	case err != nil:
+		return "", err
+	case info.Module.Path != gopkg && !strings.HasPrefix(gopkg, info.Module.Path+"/"):
+		return fmt.Sprintf("pkgsite resolves %q to unrelated module %q", gopkg, info.Module.Path), nil
+	case gitCloneURLFromRepoURL(info.Module.RepoURL) == "":
+		return fmt.Sprintf("pkgsite module %q has no repository URL", info.Module.Path), nil
+	}
+	return "", nil
+}
+
+func preflightPackRequests(ctx context.Context, requests []packRequest, opts packOptions) (err error) {
+	defer func() {
+		if err != nil {
+			cleanupPreparedRequests(requests)
+		}
+	}()
+
+	seenOutputDirs := make(map[string]string)
+	checkOutputDir := func(req *packRequest, gopkg string, effectivePkgType packageType) error {
+		if opts.providesPath != "" && effectivePkgType == typeProgram {
+			return fmt.Errorf("%q: -provides requires a package type that includes a library; use -type to select one", req.arg)
+		}
+		dir := nameFromGopkg(gopkg, effectivePkgType, opts.customProgPkgName, opts.allowUnknownHoster)
+		if previous, ok := seenOutputDirs[dir]; ok {
+			return fmt.Errorf("%q and %q use %q", previous, req.arg, dir)
+		}
+		seenOutputDirs[dir] = req.arg
+		if err := checkEmptyOutputDir(dir); err != nil {
+			return fmt.Errorf("%q: %w", req.arg, err)
+		}
+		return nil
+	}
+
+	// First run the cheap checks for every request, so that a bad entry fails
+	// before any repository is cloned.
+	type gitFallback struct {
+		req    *packRequest
+		gopkg  string
+		reason string
+	}
+	var fallbacks []gitFallback
+	seenFallbacks := make(map[string]string)
+	for i := range requests {
+		req := &requests[i]
+		gopkg := trimRepoScheme(req.gopkg)
+		if opts.repoURL != "" {
+			fallbacks = append(fallbacks, gitFallback{req: req, gopkg: gopkg, reason: fmt.Sprintf("using explicit repository URL %s", opts.repoURL)})
+			if opts.pkgType != typeGuess {
+				if err := checkOutputDir(req, gopkg, opts.pkgType); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		info, lookupErr := getPkgsiteInfo(ctx, gopkg)
+		reason, err := needsGitSourceFallback(gopkg, info, lookupErr)
 		if err != nil {
 			return fmt.Errorf("%q: %w", req.arg, err)
 		}
-		if repoURL := gitCloneURLFromRepoURL(info.Module.RepoURL); repoURL == "" {
-			return fmt.Errorf("%q: no repository URL", req.arg)
+		if reason != "" {
+			if previous, ok := seenFallbacks[gopkg]; ok {
+				return fmt.Errorf("%q and %q both request %q", previous, req.arg, gopkg)
+			}
+			seenFallbacks[gopkg] = req.arg
+			fallbacks = append(fallbacks, gitFallback{req: req, gopkg: gopkg, reason: reason})
+			if opts.pkgType != typeGuess {
+				if err := checkOutputDir(req, gopkg, opts.pkgType); err != nil {
+					return err
+				}
+			}
+			continue
 		}
 		if req.revision != "" && strings.HasPrefix(req.revision, "v") && !module.IsPseudoVersion(req.revision) {
 			if _, err := getPkgsiteModule(ctx, info.Module.Path, req.revision); err != nil {
 				return fmt.Errorf("%q@%s: %w", req.arg, req.revision, err)
 			}
 		}
-
-		effectivePkgType := pkgType
+		effectivePkgType := opts.pkgType
 		if effectivePkgType == typeGuess {
 			effectivePkgType = typeLibrary
 			if info.Package.Name == "main" {
 				effectivePkgType = typeProgram
 			}
 		}
-		if providesPath != "" && effectivePkgType == typeProgram {
-			return fmt.Errorf("%q: -provides requires a package type that includes a library; use -type to select one", req.arg)
+		if err := checkOutputDir(req, gopkg, effectivePkgType); err != nil {
+			return err
 		}
-		dir := nameFromGopkg(gopkg, effectivePkgType, customProgPkgName, allowUnknownHoster)
-		if previous, ok := seenOutputDirs[dir]; ok {
-			return fmt.Errorf("%q and %q use %q", previous, req.arg, dir)
+	}
+
+	// Packages not on pkg.go.dev (or using -repo_url) need their source to
+	// determine the guessed package type.
+	for _, fb := range fallbacks {
+		log.Printf("%s; using Git repository", fb.reason)
+		fb.req.prepared, err = makeUpstreamSourceTarball(fb.gopkg, fb.req.revision, opts.forcePrerelease, nil, opts.repoURL)
+		if err != nil {
+			return fmt.Errorf("%q: %s, and the Git source fallback failed: %w", fb.req.arg, fb.reason, err)
 		}
-		seenOutputDirs[dir] = req.arg
-		dirInfo, err := os.Stat(dir)
-		if err == nil {
-			if !dirInfo.IsDir() {
-				return fmt.Errorf("%q: %q is not a directory", req.arg, dir)
+		if opts.pkgType == typeGuess {
+			if err := checkOutputDir(fb.req, fb.gopkg, guessedPackageType(fb.req.prepared)); err != nil {
+				return err
 			}
-			entries, err := os.ReadDir(dir)
-			if err != nil {
-				return fmt.Errorf("%q: read %q: %w", req.arg, dir, err)
-			}
-			if len(entries) != 0 {
-				return fmt.Errorf("%q: %q is non empty", req.arg, dir)
-			}
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("%q: stat %q: %w", req.arg, dir, err)
 		}
 	}
 	return nil
@@ -1291,29 +1476,17 @@ func parsePackArg(arg, defaultRevision string) (string, string, error) {
 	return arg, defaultRevision, nil
 }
 
-func packPackage(gopkg, gitRevision string, forcePrerelease bool, pkgType packageType, customProgPkgName string, allowUnknownHoster bool, providesPath string) {
-	// Remove URL scheme if present (https://, http://, git://, etc.)
-	gopkg = strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(gopkg, "https://"), "http://"), "git://")
-
-	// Verify the provided argument using the official pkg.go.dev API. Keep the
-	// requested path for naming and go_import_path; use the module path only for
-	// source checkout and tarball generation.
-	info, err := getPkgsiteInfo(context.TODO(), gopkg)
-	if err != nil {
-		log.Fatalf("Verifying arguments: %v — did you specify a Go package import path?", err)
-	}
-	sourceGopkg := sourceImportPathForPackage(gopkg, info)
-	if sourceGopkg != gopkg {
-		log.Printf("Using module root %q as source checkout for specified import path %q", sourceGopkg, gopkg)
-	}
+func packPackage(gopkg, gitRevision string, opts packOptions, prepared *upstream) error {
+	gopkg = trimRepoScheme(gopkg)
 
 	// Set default source and binary package names.
-	openRuyiSrc := nameFromGopkg(gopkg, typeLibrary, customProgPkgName, allowUnknownHoster)
+	openRuyiSrc := nameFromGopkg(gopkg, typeLibrary, opts.customProgPkgName, opts.allowUnknownHoster)
 	openRuyiLib := openRuyiSrc
-	openRuyiProgram := nameFromGopkg(gopkg, typeProgram, customProgPkgName, allowUnknownHoster)
+	openRuyiProgram := nameFromGopkg(gopkg, typeProgram, opts.customProgPkgName, opts.allowUnknownHoster)
 
+	pkgType := opts.pkgType
 	if pkgType != typeGuess {
-		openRuyiSrc = nameFromGopkg(gopkg, pkgType, customProgPkgName, allowUnknownHoster)
+		openRuyiSrc = nameFromGopkg(gopkg, pkgType, opts.customProgPkgName, opts.allowUnknownHoster)
 	}
 
 	if strings.ToLower(gopkg) != gopkg {
@@ -1330,44 +1503,41 @@ func packPackage(gopkg, gitRevision string, forcePrerelease bool, pkgType packag
 	// NOTE: directory existence is checked after determining final openRuyiSrc
 
 	// Create a tarball of the upstream source
-	u, err := makeUpstreamSourceTarball(gopkg, sourceGopkg, gitRevision, forcePrerelease)
-	if err != nil {
-		log.Fatalf("Could not create a tarball of the upstream source: %v\n", err)
+	u := prepared
+	var err error
+	if u == nil {
+		info, lookupErr := getPkgsiteInfo(context.TODO(), gopkg)
+		if lookupErr != nil {
+			return fmt.Errorf("get package metadata: %w", lookupErr)
+		}
+		u, err = makeUpstreamSourceTarball(gopkg, gitRevision, opts.forcePrerelease, info, "")
+		if err != nil {
+			return fmt.Errorf("create upstream source tarball: %w", err)
+		}
 	}
+	defer os.Remove(u.tarPath)
 
 	if pkgType == typeGuess {
 		switch guessedPackageType(u) {
 		case typeProgram:
 			if u.packageName == "main" {
-				log.Printf("Assuming you are packaging a program (because pkg.go.dev reports package %q as main), use -type to override\n", gopkg)
+				log.Printf("Assuming you are packaging a program (because package %q is main), use -type to override\n", gopkg)
 			} else {
 				log.Printf("Assuming you are packaging a program (because %q defines a main package), use -type to override\n", u.firstMain)
 			}
 			pkgType = typeProgram
-			openRuyiSrc = nameFromGopkg(gopkg, pkgType, customProgPkgName, allowUnknownHoster)
+			openRuyiSrc = nameFromGopkg(gopkg, pkgType, opts.customProgPkgName, opts.allowUnknownHoster)
 		default:
 			if u.firstMain != "" {
-				log.Printf("Found main package %q, but pkg.go.dev reports root package %q; assuming library, use -type to override\n", u.firstMain, u.packageName)
+				log.Printf("Found main package %q and root package %q; assuming library, use -type to override\n", u.firstMain, u.packageName)
 			}
 			pkgType = typeLibrary
 		}
 	}
 
 	// Now that we know the final package name, check output directory
-	dirInfo, err := os.Stat(openRuyiSrc)
-	if err == nil {
-		if !dirInfo.IsDir() {
-			log.Fatalf("%q exists but is not a directory\n", openRuyiSrc)
-		}
-		entries, err := os.ReadDir(openRuyiSrc)
-		if err != nil {
-			log.Fatalf("Failed to read directory %q: %v\n", openRuyiSrc, err)
-		}
-		if len(entries) != 0 {
-			log.Fatalf("Output directory %q exists and is non-empty, aborting\n", openRuyiSrc)
-		}
-	} else if !os.IsNotExist(err) {
-		log.Fatalf("Failed to stat %q: %v\n", openRuyiSrc, err)
+	if err := checkEmptyOutputDir(openRuyiSrc); err != nil {
+		return fmt.Errorf("output directory %w", err)
 	}
 
 	orig := fmt.Sprintf("%s_%s.orig.tar.%s", openRuyiSrc, u.version, u.compression)
@@ -1375,21 +1545,19 @@ func packPackage(gopkg, gitRevision string, forcePrerelease bool, pkgType packag
 	// We need to copy the file, merely renaming is not enough since the file
 	// might be on a different filesystem (/tmp often is a tmpfs).
 	if err := copyFile(u.tarPath, orig); err != nil {
-		log.Fatalf("Could not rename orig tarball from %q to %q: %v\n", u.tarPath, orig, err)
-	}
-	if err := os.Remove(u.tarPath); err != nil {
-		log.Printf("Could not remove tempfile %q: %v\n", u.tarPath, err)
+		return fmt.Errorf("copy source tarball from %q to %q: %w", u.tarPath, orig, err)
 	}
 
 	// Now we create our rpm spec file from the gathered information.
 	dir, err := createDirectory(openRuyiSrc)
 	if err != nil {
-		log.Fatalf("Could not create repository: %v\n", err)
+		return fmt.Errorf("create output directory: %w", err)
 	}
 
 	if err := writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, u.version,
-		pkgType, u, providesPath); err != nil {
-		log.Fatalf("Could not create spec file: %v\n", err)
+		pkgType, u, opts.providesPath); err != nil {
+		_ = os.Remove(orig)
+		return fmt.Errorf("create spec file: %w", err)
 	}
 
 	log.Println("Done!")
@@ -1409,4 +1577,5 @@ func packPackage(gopkg, gitRevision string, forcePrerelease bool, pkgType packag
 		fmt.Printf("    Binary: %s\n", openRuyiLib)
 	}
 	fmt.Printf("\n")
+	return nil
 }

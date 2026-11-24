@@ -73,44 +73,36 @@ func getSpecAssetFilesForGopkg(gopkg string) (specAssetFiles, error) {
 func writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, version string,
 	pkgType packageType, u *upstream, providesPath string) error {
 
+	importPath := gopkg
+	if u.importPath != "" {
+		importPath = u.importPath
+	}
+	var metadata specMetadata
+	if u.metadata != nil {
+		metadata = *u.metadata
+	} else {
+		metadata = readSpecMetadata(gopkg, "")
+	}
+	description, license := metadata.description, metadata.license
+	longdescription := convertLongDescriptionForRPM(metadata.longDescription)
+
 	f, err := os.Create(filepath.Join(dir, "", openRuyiSrc+".spec"))
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	description, err := getDescriptionForGopkg(gopkg)
-	if err != nil {
-		log.Printf("Could not determine description for %q: %v\n", gopkg, err)
-		description = "TODO: short description"
-	}
-	longdescription, err := getLongDescriptionForGopkg(gopkg)
-	if err != nil {
-		log.Printf("Could not determine long description for %q: %v\n", gopkg, err)
-		longdescription = "TODO: long description"
-	}
-	longdescription = convertLongDescriptionForRPM(longdescription)
-	license, err := getLicenseForGopkg(gopkg)
-	if err != nil {
-		log.Printf("Could not determine license for %q: %v\n", gopkg, err)
-		license = "TODO"
-	}
-	assetFiles, err := getSpecAssetFilesForGopkg(gopkg)
-	if err != nil {
-		log.Printf("Could not determine license/doc file paths for %q: %v\n", gopkg, err)
-	}
 	upstreamName := filepath.Base(gopkg)
 	if regexp.MustCompile(`^v\d+$`).MatchString(upstreamName) {
 		upstreamName = filepath.Base(filepath.Dir(gopkg))
 	}
-	repoURL, err := getRepoURLForGopkg(gopkg)
-	if err != nil {
-		log.Printf("Could not determine repository URL for %q: %v\n", gopkg, err)
+	repoURL := u.repoURL
+	if repoURL == "" {
 		repoURL = "TODO"
 	}
 
 	if providesPath == "" {
-		providesPath = gopkg
+		providesPath = importPath
 	}
 
 	// Write the spec file content
@@ -124,7 +116,7 @@ func writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, version st
 
 	// Macros
 	fmt.Fprintf(f, "%%define _name           %s\n", upstreamName)
-	fmt.Fprintf(f, "%%define go_import_path  %s\n", gopkg)
+	fmt.Fprintf(f, "%%define go_import_path  %s\n", importPath)
 
 	if u.commitID != "" {
 		fmt.Fprintf(f, "%%define commit_id %s\n", u.commitID)
@@ -207,7 +199,7 @@ func writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, version st
 	fmt.Fprintf(f, "%s\n\n", strings.TrimRight(longdescription, "\n"))
 
 	// %files
-	writeRPMFilesSection(f, openRuyiSrc, openRuyiLib, openRuyiProgram, pkgType, assetFiles)
+	writeRPMFilesSection(f, openRuyiSrc, openRuyiLib, openRuyiProgram, pkgType, metadata.assetFiles)
 
 	// %changelog
 	fmt.Fprintf(f, "%%changelog\n")

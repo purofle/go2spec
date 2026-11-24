@@ -391,6 +391,8 @@ func TestWriteSpecCustomProvidesPreservesImportIdentity(t *testing.T) {
 				t.Fatalf("custom Provides changed other spec fields:\n%s", got)
 			}
 			for _, field := range []string{
+				"Summary:        Bindings for the Discord API\n",
+				"License:        BSD-3-Clause\n",
 				"%define go_import_path  " + original + "\n",
 				"%{go_sys_gopath}/%{go_import_path}\n",
 				"Source0:        https://github.com/yeongaori/discordgo-fork/archive/v0.29.0.tar.gz#/%{_name}-%{version}.tar.gz\n",
@@ -406,6 +408,148 @@ func TestWriteSpecCustomProvidesPreservesImportIdentity(t *testing.T) {
 			}
 			if data, err := os.ReadFile(modPath); err != nil || string(data) != modContent {
 				t.Fatalf("source go.mod changed: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestPackForkGitSource(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		redirected bool
+		revision   string
+		force      bool
+	}{
+		{name: "missing-pkgsite-tag", revision: "v1.2.3"},
+		{name: "redirected-pkgsite-pseudo", redirected: true, revision: "pseudo"},
+		{name: "missing-pkgsite-default"},
+		{name: "missing-pkgsite-prerelease", force: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const fork = "github.com/go2spec-fixtures/sdk-fork"
+			const original = "github.com/go2spec-fixtures/sdk"
+			modContent := "module " + original + "\n\ngo 1.18\n"
+			repo := t.TempDir()
+			for name, content := range map[string]string{
+				"go.mod":                    modContent,
+				"sdk.go":                    "package sdk\nimport (\"" + original + "/internal/helper\"; _ \"github.com/runtime/dep\")\nfunc ForkOnly() string { return helper.Value() }\n",
+				"sdk_test.go":               "package sdk_test\nimport _ \"github.com/testonly/dep\"\n",
+				"internal/helper/helper.go": "package helper\nfunc Value() string { return \"fork\" }\n",
+				"cmd/tool/main.go":          "package main\nfunc main() {}\n",
+				"LICENSE":                   "Fork license text\n",
+				"README.md":                 "# SDK Fork\n\nA fork with its own source code.\n",
+			} {
+				aggregateWriteFile(t, filepath.Join(repo, name), []byte(content))
+			}
+			runGit(t, repo, nil, "init")
+			runGit(t, repo, nil, "config", "commit.gpgsign", "false")
+			runGit(t, repo, nil, "config", "tag.gpgsign", "false")
+			runGit(t, repo, nil, "add", ".")
+			runGit(t, repo, []string{
+				"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.invalid",
+				"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.invalid",
+			}, "commit", "-m", "fork source")
+			runGit(t, repo, nil, "tag", "v1.2.3")
+			hash := strings.TrimSpace(runGit(t, repo, nil, "rev-parse", "HEAD"))
+			archive := runGit(t, repo, nil, "archive", "--format=tar.gz", "--prefix=sdk-fork-1.2.3/", "v1.2.3")
+			git, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
+			quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
+			bin := t.TempDir()
+			wrapper := "#!/bin/sh\nexec " + quote(git) + " -c " + quote("url.file://"+repo+".insteadOf=https://"+fork) + " \"$@\"\n"
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			oldHTTPClient := http.DefaultClient
+			http.DefaultClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.String() == "https://"+fork+"/archive/v1.2.3.tar.gz" {
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(archive)), Header: make(http.Header)}, nil
+				}
+				return nil, fmt.Errorf("unexpected source request: %s", r.URL)
+			})}
+			t.Cleanup(func() { http.DefaultClient = oldHTTPClient })
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !tt.redirected {
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = io.WriteString(w, `{"code":404,"message":"not found"}`)
+					return
+				}
+				if strings.HasPrefix(r.URL.Path, "/package/") {
+					fmt.Fprintf(w, `{"path":%q,"modulePath":%q,"version":"v1.2.3","name":"sdk"}`, fork, original)
+				} else {
+					fmt.Fprintf(w, `{"path":%q,"version":"v1.2.3","repoUrl":%q}`, original, "https://"+original)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			oldBase, oldClient, oldCache := pkgsiteAPIBase, pkgsiteHTTPClient, pkgsiteInfoCache
+			pkgsiteAPIBase, pkgsiteHTTPClient, pkgsiteInfoCache = srv.URL, srv.Client(), make(map[string]*pkgsiteInfo)
+			t.Cleanup(func() {
+				pkgsiteAPIBase, pkgsiteHTTPClient, pkgsiteInfoCache = oldBase, oldClient, oldCache
+			})
+			t.Chdir(t.TempDir())
+			args := []string{"-provides", fork}
+			if tt.force {
+				args = append(args, "-force_prerelease")
+			}
+			arg := fork
+			if tt.revision == "pseudo" {
+				arg += "@v0.0.0-20260722051018-" + hash[:12]
+			} else if tt.revision != "" {
+				arg += "@" + tt.revision
+			}
+			workRoot := t.TempDir()
+			t.Setenv("TMPDIR", workRoot)
+			if code := mainPack(append(args, arg), nil); code != 0 {
+				t.Fatalf("pack exit = %d", code)
+			}
+			if workDirs, err := filepath.Glob(filepath.Join(workRoot, "pack-tmp*")); err != nil || len(workDirs) != 0 {
+				t.Fatalf("temporary source workspace was not cleaned up: %v, %v", workDirs, err)
+			}
+			const rpmName = "go-github-go2spec-fixtures-sdk-fork"
+			data, err := os.ReadFile(filepath.Join(rpmName, rpmName+".spec"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := string(data)
+			ref := "v%{version}"
+			if tt.force {
+				ref = "%{commit_id}"
+			} else if tt.revision == "pseudo" {
+				ref = hash[:12]
+			}
+			for _, want := range []string{
+				"Summary:        A fork with its own source code\n",
+				"License:        TODO\n",
+				"Name:           " + rpmName + "\n",
+				"%define go_import_path  " + original + "\n",
+				"Provides:       go(" + fork + ") = %{version}\n",
+				"URL:            https://" + fork + "\n",
+				"Source0:        https://" + fork + "/archive/" + ref + ".tar.gz#/",
+				"%{go_sys_gopath}/%{go_import_path}\n",
+				"BuildRequires:  go(github.com/runtime/dep)\n",
+				"BuildRequires:  go(github.com/testonly/dep)\n",
+				"Requires:       go(github.com/runtime/dep)\n",
+				"%license LICENSE\n", "%doc README.md\n",
+			} {
+				if !strings.Contains(spec, want) {
+					t.Errorf("missing %q in spec:\n%s", want, spec)
+				}
+			}
+			if strings.Contains(spec, "go("+original+")") || strings.Contains(spec, "go("+original+"/") ||
+				strings.Contains(spec, "\nRequires:       go(github.com/testonly/dep)") || strings.Contains(spec, "proxy.golang.org") {
+				t.Fatal("unexpected self-dependency, test-only runtime dependency or proxy source")
+			}
+			archives, err := filepath.Glob(rpmName + "_*.orig.tar.*")
+			if err != nil || len(archives) != 1 {
+				t.Fatalf("source archives: %v, %v", archives, err)
+			}
+			cmd := exec.Command("tar", "-xOf", archives[0], "--wildcards", "*/go.mod")
+			actualMod, err := cmd.Output()
+			if err != nil || string(actualMod) != modContent {
+				t.Fatalf("source module declaration changed: %q, %v", actualMod, err)
 			}
 		})
 	}
@@ -651,7 +795,7 @@ func TestPkgVersionFromGitAcceptsUnprefixedSemverPreferredRevision(t *testing.T)
 		"GIT_COMMITTER_NAME=Test",
 		"GIT_COMMITTER_EMAIL=test@example.invalid",
 	}, "commit", "-m", "initial")
-	runGit(t, dir, nil, "tag", "v1.2.0")
+	runGit(t, dir, nil, "-c", "tag.gpgsign=false", "tag", "v1.2.0")
 
 	u := upstream{}
 	got, err := pkgVersionFromGit(dir, &u, "1.2.0", false)
