@@ -752,6 +752,24 @@ func (u *upstream) findDependencies(gopath, repo string) error {
 	return nil
 }
 
+// gitFallbackRepoPath derives the repository path to clone for requestedPath
+// when pkg.go.dev does not know it and no -repo_url is given.
+func gitFallbackRepoPath(requestedPath string) (string, error) {
+	repoPath, _, _ := module.SplitPathVersion(requestedPath)
+	host, _, _ := strings.Cut(repoPath, "/")
+	if host != "github.com" && host != "codeberg.org" {
+		return repoPath, nil
+	}
+	// These hosts use a fixed owner/repo layout, so a longer path is a
+	// subdirectory module or subpackage. Cloning the repository root would
+	// package a different module, so reject it.
+	root := repoRootImportPath("https://" + repoPath)
+	if root != "" && root != repoPath {
+		return "", fmt.Errorf("%q is below repository root %q; Git source fallback only supports repository-root modules", requestedPath, root)
+	}
+	return repoPath, nil
+}
+
 // makeUpstreamSourceTarball downloads the source module from the Internet,
 // checks out the specified revision, determines the version number, removes
 // vendored dependencies, and creates a tarball of the upstream source code.
@@ -768,7 +786,10 @@ func makeUpstreamSourceTarball(requestedPath, revision string, forcePrerelease b
 		if explicitRepoURL != "" {
 			u.repoURL = gitCloneURLFromRepoURL(explicitRepoURL)
 		} else {
-			repoPath, _, _ := module.SplitPathVersion(requestedPath)
+			repoPath, err := gitFallbackRepoPath(requestedPath)
+			if err != nil {
+				return nil, err
+			}
 			u.repoURL = gitCloneURLFromRepoURL("https://" + repoPath)
 		}
 	} else {
