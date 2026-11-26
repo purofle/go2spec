@@ -99,6 +99,23 @@ go2spec pack -type library -provides github.com/yeongaori/discordgo-fork github.
 
 通过 `-conflicts` 显式指定一个或多个存在冲突的 RPM 包名（多个包可重复传参），会在生成的 spec 中写出对应的 `Conflicts:` 及注释模板，由维护者补充具体冲突原因。
 
+## Go Module `replace` 解析
+
+当上游项目的 `go.mod` 含有实际生效的远程 `replace` 指令时，`pack` 会将被替换模块及其子包的依赖映射为替换目标对应的 `go(...)` capability，写入 `BuildRequires:` 和适用的 `Requires:`。
+
+以公开项目 `github.com/sipeed/picoclaw`（将 `github.com/bwmarrin/discordgo` 替换为 `github.com/yeongaori/discordgo-fork`）为例，完整工作流程如下：
+
+```bash
+# 1. 打包 Fork：声明独立 Provides 及与原包的冲突
+go2spec pack -type library \
+  -provides github.com/yeongaori/discordgo-fork \
+  -conflicts go-github-bwmarrin-discordgo \
+  github.com/yeongaori/discordgo-fork@v0.0.0-20260319072544-e8e546f5d532
+
+# 2. 打包 picoclaw：自动按 replace 生成 BuildRequires: go(github.com/yeongaori/discordgo-fork)
+go2spec pack github.com/sipeed/picoclaw
+```
+
 ## 多个 module 分别选版本，合成一个 RPM
 
 使用 `-combine` 显式开启新的 **library 源码 RPM spec** 模式。每个 module 都使用自己

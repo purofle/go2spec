@@ -106,6 +106,28 @@ Use `-conflicts` to explicitly declare one or more conflicting RPM package names
 entry with a comment placeholder for the maintainer to explain why the packages
 cannot coexist.
 
+## Go Module Replacements
+
+When the upstream `go.mod` contains active remote `replace` directives, `pack`
+maps imports from the replaced module (including subpackages) to the
+replacement module's `go(...)` capability in `BuildRequires:` and, where
+applicable, `Requires:`.
+
+For example, the public project `github.com/sipeed/picoclaw` replaces
+`github.com/bwmarrin/discordgo` with `github.com/yeongaori/discordgo-fork`. The
+complete workflow is:
+
+```bash
+# 1. Package the fork: declare its own Provides and a Conflict with the original
+go2spec pack -type library \
+  -provides github.com/yeongaori/discordgo-fork \
+  -conflicts go-github-bwmarrin-discordgo \
+  github.com/yeongaori/discordgo-fork@v0.0.0-20260319072544-e8e546f5d532
+
+# 2. Package picoclaw: replace generates BuildRequires: go(github.com/yeongaori/discordgo-fork)
+go2spec pack github.com/sipeed/picoclaw
+```
+
 ## Combine Independent Module Releases into One RPM
 
 `-combine` opts into a separate **library source RPM spec** mode. Each module keeps

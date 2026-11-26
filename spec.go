@@ -170,12 +170,12 @@ func writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, version st
 	fmt.Fprintf(f, "BuildRequires:  go\n")
 	fmt.Fprintf(f, "BuildRequires:  go-rpm-macros\n")
 	// And other BuildRequires from dependencies
-	rpmBuildDeps := convertDependenciesToRPM(u.repoDeps)
+	rpmBuildDeps := convertDependenciesToRPM(u.repoDeps, u.exactModules)
 	sort.Strings(rpmBuildDeps)
 	for _, dep := range rpmBuildDeps {
 		fmt.Fprintf(f, "BuildRequires:  %s\n", dep)
 	}
-	rpmRuntimeDeps := convertDependenciesToRPM(u.repoRunDeps)
+	rpmRuntimeDeps := convertDependenciesToRPM(u.repoRunDeps, u.exactModules)
 	sort.Strings(rpmRuntimeDeps)
 
 	// For different package types, write different sections
@@ -343,11 +343,15 @@ func convertLongDescriptionForRPM(openRuyiSrc string) string {
 	return strings.Join(result, "\n")
 }
 
-func convertDependenciesToRPM(goPkgs []string) []string {
+func convertDependenciesToRPM(goPkgs []string, exactModules map[string]bool) []string {
 	// 使用 map 来去重和提取顶级包路径
 	topLevelPkgs := make(map[string]bool)
 
 	for _, goPkg := range goPkgs {
+		if exactModules[goPkg] {
+			topLevelPkgs[goPkg] = true
+			continue
+		}
 		// 提取顶级包：github.com/user/repo/subpkg -> github.com/user/repo
 		parts := strings.Split(goPkg, "/")
 		var topLevel string

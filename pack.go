@@ -39,25 +39,26 @@ const (
 type upstream struct {
 	repoURL      string
 	modulePath   string
-	importPath   string        // module directive from source when it differs or pkgsite cannot locate it
-	metadata     *specMetadata // metadata read from local source checkout when pkgsite is not used
-	tarPath      string        // path to the downloaded or generated orig tarball tempfile
-	compression  string        // compression method, either "gz" or "xz"
-	version      string        // upstream version number, e.g. 0.0~git20180204.1d24609
-	commitID     string        // full commit hash for commit-pinned snapshot builds
-	tag          string        // Latest upstream tag, if any
-	commitIsh    string        // commit-ish corresponding to upstream version to be packaged
-	remote       string        // git remote, set to short hostname if upstream git history is included
-	firstMain    string        // import path of the first main package within repo, if any
-	packageName  string        // package name from pkgsite or the downloaded source
-	vendorDirs   []string      // all vendor sub directories, relative to the repo directory
-	repoDeps     []string      // all non-stdlib imports needed for build or tests
-	repoRunDeps  []string      // non-stdlib imports needed by normal builds, excluding test-only imports
-	repoTestDeps []string      // non-stdlib imports needed only by tests
-	hasGodeps    bool          // whether the Godeps/_workspace directory exists
-	hasRelease   bool          // whether any release tags exist, for debian/watch
-	isRelease    bool          // whether what we end up packaging is a tagged release
-	sha256       string        // SHA256 checksum of the source tarball
+	importPath   string          // module directive from source when it differs or pkgsite cannot locate it
+	metadata     *specMetadata   // metadata read from local source checkout when pkgsite is not used
+	tarPath      string          // path to the downloaded or generated orig tarball tempfile
+	compression  string          // compression method, either "gz" or "xz"
+	version      string          // upstream version number, e.g. 0.0~git20180204.1d24609
+	commitID     string          // full commit hash for commit-pinned snapshot builds
+	tag          string          // Latest upstream tag, if any
+	commitIsh    string          // commit-ish corresponding to upstream version to be packaged
+	remote       string          // git remote, set to short hostname if upstream git history is included
+	firstMain    string          // import path of the first main package within repo, if any
+	packageName  string          // package name from pkgsite or the downloaded source
+	vendorDirs   []string        // all vendor sub directories, relative to the repo directory
+	repoDeps     []string        // all non-stdlib imports needed for build or tests
+	repoRunDeps  []string        // non-stdlib imports needed by normal builds, excluding test-only imports
+	repoTestDeps []string        // non-stdlib imports needed only by tests
+	exactModules map[string]bool // resolved module capability paths preserved verbatim in RPM deps
+	hasGodeps    bool            // whether the Godeps/_workspace directory exists
+	hasRelease   bool            // whether any release tags exist, for debian/watch
+	isRelease    bool            // whether what we end up packaging is a tagged release
+	sha256       string          // SHA256 checksum of the source tarball
 }
 
 var errUnsupportedHoster = errors.New("unsupported hoster")
@@ -681,12 +682,18 @@ func (u *upstream) setRepoDependencies(runtimeDeps, testDeps map[string]bool) {
 func (u *upstream) findDependencies(gopath, repo string) error {
 	log.Printf("Determining dependencies\n")
 
+	repoDir := filepath.Join(gopath, "src", repo)
 	pattern, importPath := repo, repo
 	if u.importPath != "" {
 		pattern, importPath = ".", u.importPath
 	}
+	replaces, err := loadModuleReplacements(repoDir, importPath)
+	if err != nil {
+		return err
+	}
+
 	cmd := exec.Command("go", "list", "-e", "-json", pattern+"/...")
-	cmd.Dir = filepath.Join(gopath, "src", repo)
+	cmd.Dir = repoDir
 	cmd.Env = passthroughEnv()
 	cmd.Stderr = os.Stderr
 
@@ -696,7 +703,7 @@ func (u *upstream) findDependencies(gopath, repo string) error {
 		// See https://bugs.debian.org/992610
 		log.Printf("Retrying without appending \"/...\" to repo")
 		cmd = exec.Command("go", "list", "-e", "-json", pattern)
-		cmd.Dir = filepath.Join(gopath, "src", repo)
+		cmd.Dir = repoDir
 		cmd.Env = passthroughEnv()
 		cmd.Stderr = os.Stderr
 		out, err = cmd.Output()
@@ -745,6 +752,16 @@ func (u *upstream) findDependencies(gopath, repo string) error {
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		delete(runtimeDeps, line)
 		delete(testDeps, line)
+	}
+
+	if replaces != nil {
+		u.exactModules = make(map[string]bool)
+		if err := replaces.applyToDependencies(runtimeDeps, u.exactModules); err != nil {
+			return err
+		}
+		if err := replaces.applyToDependencies(testDeps, u.exactModules); err != nil {
+			return err
+		}
 	}
 
 	u.setRepoDependencies(runtimeDeps, testDeps)
