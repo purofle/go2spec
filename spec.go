@@ -147,6 +147,10 @@ func writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, version st
 	if sourceModulePath == "" {
 		sourceModulePath = gopkg
 	}
+	if u.importPath != "" && u.importPath != sourceModulePath {
+		// The module proxy rejects forks whose go.mod declares another path.
+		sourceModulePath = ""
+	}
 	sourceURL, err := u.sourceURLForSpec(sourceModulePath)
 	if err != nil {
 		log.Printf("Could not determine remote source URL for %q: %v\n", gopkg, err)
