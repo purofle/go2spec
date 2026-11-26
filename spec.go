@@ -71,7 +71,7 @@ func getSpecAssetFilesForGopkg(gopkg string) (specAssetFiles, error) {
 }
 
 func writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, version string,
-	pkgType packageType, u *upstream, providesPath string) error {
+	pkgType packageType, u *upstream, providesPath string, conflicts []string) error {
 
 	importPath := gopkg
 	if u.importPath != "" {
@@ -177,17 +177,21 @@ func writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, version st
 	// For different package types, write different sections
 	switch pkgType {
 	case typeLibrary:
-		writeRPMLibraryPackage(f, providesPath, openRuyiLib, longdescription, rpmRuntimeDeps)
+		writeRPMLibraryPackage(f, providesPath, openRuyiLib, longdescription, rpmRuntimeDeps, conflicts)
 	case typeProgram:
 		log.Printf("Nothing to do for program package.\n")
+		if len(conflicts) > 0 {
+			fmt.Fprintf(f, "\n")
+			writeRPMConflicts(f, conflicts)
+		}
 	// TODO: what can this be used for? ExclusiveArch %%{go_arches}?
 	//	writeRPMProgramPackage(f, gopkg, openRuyiProgram, longdescription)
 	case typeLibraryProgram:
-		writeRPMLibraryPackage(f, providesPath, openRuyiLib, longdescription, rpmRuntimeDeps)
+		writeRPMLibraryPackage(f, providesPath, openRuyiLib, longdescription, rpmRuntimeDeps, conflicts)
 		writeRPMProgramSubpackage(f, gopkg, openRuyiProgram, openRuyiSrc, description)
 	case typeProgramLibrary:
 		//writeRPMProgramPackage(f, gopkg, openRuyiProgram, longdescription)
-		writeRPMLibrarySubpackage(f, gopkg, providesPath, openRuyiLib, openRuyiSrc, longdescription, rpmRuntimeDeps)
+		writeRPMLibrarySubpackage(f, gopkg, providesPath, openRuyiLib, openRuyiSrc, longdescription, rpmRuntimeDeps, conflicts)
 	default:
 		log.Fatalf("Invalid pkgType %d in writeRPMSpec(), aborting", pkgType)
 	}
@@ -208,11 +212,23 @@ func writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, version st
 	return nil
 }
 
+func writeRPMConflicts(f *os.File, conflicts []string) {
+	for _, pkg := range conflicts {
+		fmt.Fprintf(f, "# Conflicts with %s.\n", pkg)
+		fmt.Fprintf(f, "# TODO: Explain why these packages cannot coexist.\n")
+		fmt.Fprintf(f, "Conflicts:      %s\n", pkg)
+	}
+}
+
 // For library package
-func writeRPMLibraryPackage(f *os.File, providesPath, openRuyiLib, longdesc string, deps []string) {
+func writeRPMLibraryPackage(f *os.File, providesPath, openRuyiLib, longdesc string, deps, conflicts []string) {
 	fmt.Fprintf(f, "\n")
 	fmt.Fprintf(f, "Provides:       go(%s) = %%{version}\n", providesPath)
 	fmt.Fprintf(f, "\n")
+	if len(conflicts) > 0 {
+		writeRPMConflicts(f, conflicts)
+		fmt.Fprintf(f, "\n")
+	}
 	// 库包的运行时依赖
 	if len(deps) > 0 {
 		for _, dep := range deps {
@@ -223,17 +239,19 @@ func writeRPMLibraryPackage(f *os.File, providesPath, openRuyiLib, longdesc stri
 }
 
 // For library subpackage
-func writeRPMLibrarySubpackage(f *os.File, gopkg, providesPath, openRuyiLib, openRuyiSrc, longdesc string, deps []string) {
+func writeRPMLibrarySubpackage(f *os.File, gopkg, providesPath, openRuyiLib, openRuyiSrc, longdesc string, deps, conflicts []string) {
 	fmt.Fprintf(f, "\n")
 	fmt.Fprintf(f, "%%package -n %s\n", openRuyiLib)
 	fmt.Fprintf(f, "Summary:        Development files of %s\n", filepath.Base(gopkg))
 	fmt.Fprintf(f, "Provides:       go(%s) = %%{version}\n", providesPath)
 	fmt.Fprintf(f, "BuildArch:      noarch\n")
-	if len(deps) > 0 {
-		for _, dep := range deps {
-			fmt.Fprintf(f, "Requires:       %s\n", dep)
-		}
-	} else {
+	if len(conflicts) > 0 {
+		writeRPMConflicts(f, conflicts)
+	}
+	for _, dep := range deps {
+		fmt.Fprintf(f, "Requires:       %s\n", dep)
+	}
+	if len(deps) == 0 {
 		fmt.Fprintf(f, "\n")
 	}
 	fmt.Fprintf(f, "%%description -n %s\n", openRuyiLib)

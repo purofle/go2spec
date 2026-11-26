@@ -75,6 +75,7 @@ type packOptions struct {
 	customProgPkgName  string
 	allowUnknownHoster bool
 	providesPath       string
+	conflicts          []string
 	repoURL            string
 }
 
@@ -1094,6 +1095,11 @@ func mainPack(args []string, usage func()) int {
 		"",
 		"Override the upstream Git repository URL for one package")
 
+	var conflicts stringListFlag
+	flagSet.Var(&conflicts,
+		"conflicts",
+		"Conflicting RPM package name; may be repeated")
+
 	var allowUnknownHoster bool
 	flagSet.BoolVar(&allowUnknownHoster,
 		"allow_unknown_hoster",
@@ -1123,7 +1129,7 @@ func mainPack(args []string, usage func()) int {
 	visited := make(map[string]bool)
 	flagSet.Visit(func(f *flag.Flag) { visited[f.Name] = true })
 	if visited["combine"] {
-		for _, name := range []string{"git_revision", "force_prerelease", "list", "program_package_name", "allow_unknown_hoster", "provides", "repo_url"} {
+		for _, name := range []string{"git_revision", "force_prerelease", "list", "program_package_name", "allow_unknown_hoster", "provides", "repo_url", "conflicts"} {
 			if visited[name] {
 				log.Printf("-%s cannot be combined with -combine", name)
 				return 1
@@ -1185,6 +1191,20 @@ func mainPack(args []string, usage func()) int {
 			return 1
 		}
 	}
+	if visited["conflicts"] {
+		for i, name := range conflicts {
+			name = strings.TrimSpace(name)
+			if !rpmNamePattern.MatchString(name) {
+				log.Printf("invalid -conflicts RPM package name %q", name)
+				return 1
+			}
+			conflicts[i] = name
+		}
+		if listFile != "" || flagSet.NArg() != 1 {
+			log.Print("-conflicts requires exactly one package argument and cannot be combined with -list")
+			return 1
+		}
+	}
 
 	// A package argument or a package-list file is required.
 	if flagSet.NArg() < 1 && listFile == "" {
@@ -1229,6 +1249,7 @@ func mainPack(args []string, usage func()) int {
 		allowUnknownHoster: allowUnknownHoster,
 		providesPath:       providesPath,
 		repoURL:            repoURL,
+		conflicts:          conflicts,
 	}
 
 	// Now we verify that all packages are valid
@@ -1555,7 +1576,7 @@ func packPackage(gopkg, gitRevision string, opts packOptions, prepared *upstream
 	}
 
 	if err := writeSpec(dir, gopkg, openRuyiSrc, openRuyiLib, openRuyiProgram, u.version,
-		pkgType, u, opts.providesPath); err != nil {
+		pkgType, u, opts.providesPath, opts.conflicts); err != nil {
 		_ = os.Remove(orig)
 		return fmt.Errorf("create spec file: %w", err)
 	}

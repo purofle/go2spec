@@ -40,6 +40,9 @@ go2spec pack golang.org/x/net
 -repo_url <url>
     覆盖单个包的 Git 源码仓库地址
 
+-conflicts <rpm-name>
+    在生成的 spec 中声明冲突的 RPM 包名（可重复指定）
+
 -allow_unknown_hoster
     允许未知 hoster 参与包名生成，生成结果必须人工检查
 ```
@@ -91,6 +94,10 @@ go2spec pack -type library -provides github.com/yeongaori/discordgo-fork github.
 ```
 
 `go_import_path` 与安装路径仍按 Fork 的 `go.mod` 生成，`-provides` 用于声明独立的 RPM capability，`License:` 保留为 `TODO` 由维护者补充。
+
+## 指定 RPM Conflicts
+
+通过 `-conflicts` 显式指定一个或多个存在冲突的 RPM 包名（多个包可重复传参），会在生成的 spec 中写出对应的 `Conflicts:` 及注释模板，由维护者补充具体冲突原因。
 
 ## 多个 module 分别选版本，合成一个 RPM
 

@@ -371,7 +371,7 @@ func TestWriteSpecCustomProvidesPreservesImportIdentity(t *testing.T) {
 			}
 			generate := func(provides string) string {
 				t.Helper()
-				if err := writeSpec(dir, original, "go-discordgo", "go-discordgo", "discordgo", "0.29.0", pkgType, u, provides); err != nil {
+				if err := writeSpec(dir, original, "go-discordgo", "go-discordgo", "discordgo", "0.29.0", pkgType, u, provides, nil); err != nil {
 					t.Fatal(err)
 				}
 				data, err := os.ReadFile(filepath.Join(dir, "go-discordgo.spec"))

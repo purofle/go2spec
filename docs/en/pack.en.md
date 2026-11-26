@@ -40,6 +40,9 @@ go2spec pack golang.org/x/net
 -repo_url <url>
     Override the upstream Git repository URL for one package
 
+-conflicts <rpm-name>
+    Declare a conflicting RPM package name in the generated spec; may be repeated
+
 -allow_unknown_hoster
     Allow package-name generation for unknown hosters, Review the generated name manually
 ```
@@ -95,6 +98,13 @@ go2spec pack -type library -provides github.com/yeongaori/discordgo-fork github.
 `go_import_path` and the installation path still follow the fork's `go.mod`,
 while `-provides` sets a separate RPM capability. `License:` is left as `TODO`
 for manual review.
+
+## RPM Conflicts
+
+Use `-conflicts` to explicitly declare one or more conflicting RPM package names
+(repeat the flag for multiple packages). Each conflict emits a `Conflicts:`
+entry with a comment placeholder for the maintainer to explain why the packages
+cannot coexist.
 
 ## Combine Independent Module Releases into One RPM
 
