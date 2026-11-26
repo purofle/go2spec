@@ -49,6 +49,13 @@ func preferredRevisionCandidates(preferredRev string) []string {
 	return candidates
 }
 
+// isGitCommit reports whether rev resolves to a commit in gitdir.
+func isGitCommit(gitdir, rev string) bool {
+	cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", rev+"^{commit}")
+	cmd.Dir = gitdir
+	return cmd.Run() == nil
+}
+
 // pkgVersionFromGit determines the actual version to be packaged
 // from the git repository status and user preference.
 // Besides returning the upstream version, the "upstream" struct fields
@@ -90,8 +97,15 @@ func pkgVersionFromGit(gitdir string, u *upstream, preferredRev string, forcePre
 	// Find @latest version tag (whether annotated or not) when the user
 	// (1) does not specify a version tag, or
 	// (2) specifies an invalid version tag.
+	// Tags without digits, such as "nightly", cannot yield a version number.
 	if len(latestTag) == 0 {
-		cmd = exec.Command("git", "describe", "--abbrev=0", "--tags", "--exclude", "*/v*")
+		args := []string{"describe", "--abbrev=0", "--tags", "--match", "*[0-9]*", "--exclude", "*/v*"}
+		if preferredRev != "" && isGitCommit(gitdir, preferredRev) {
+			// The requested commit or branch is checked out; package it as
+			// is unless a version tag points exactly at it.
+			args = append(args, "--exact-match")
+		}
+		cmd = exec.Command("git", args...)
 		cmd.Dir = gitdir
 		if out, err := cmd.Output(); err == nil {
 			latestTag = strings.TrimSpace(string(out))
